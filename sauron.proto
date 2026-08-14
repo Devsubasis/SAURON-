@@ -1,0 +1,102 @@
+// SAURON++ node-to-node mesh service.
+// gRPC is used ONLY between SAURON++ nodes (distributed threat intelligence,
+// adaptive policy sync, telemetry sharing, federated model sync, heartbeat,
+// node discovery, cluster health). Kernel<->user stays on ring buffer + BPF
+// maps; backend<->dashboard stays on WebSocket. See grpc_service.py.
+syntax = "proto3";
+package sauron;
+
+// ---- membership / SWIM ----
+message NodeInfo {
+  string node_id     = 1;
+  string address     = 2;   // host:port of the peer's mesh server
+  uint64 incarnation = 3;   // refutation counter (SWIM)
+  uint64 heartbeat   = 4;   // monotonically increasing per node
+  string state       = 5;   // ALIVE | SUSPECT | DEAD | LEFT
+  double ts          = 6;   // wall clock of the emitter
+  string region      = 7;   // edge | 5g | 6g | b6g | cloud
+}
+
+// ---- distributed threat intelligence (CRDT payload) ----
+message ThreatEvent {
+  string src_ip      = 1;
+  string dst_ip      = 2;
+  string proto       = 3;
+  string action      = 4;   // DROP | QUARANTINE | REDIRECT | RATE_LIMIT ...
+  string severity    = 5;
+  double score       = 6;
+  double confidence  = 7;   // AI confidence in [0,1]
+  double ts          = 8;   // LWW timestamp
+  string origin_node = 9;
+  string reason      = 10;
+  uint64 lamport     = 11;  // logical clock
+  double ttl         = 12;  // seconds until intel expiry
+}
+
+message ThreatBatch {
+  string origin_node        = 1;
+  repeated ThreatEvent events = 2;
+}
+
+// ---- causal policy synchronisation (vector clock) ----
+message VectorClock { map<string, uint64> clock = 1; }
+
+message PolicyUpdate {
+  string origin_node = 1;
+  string policy_id   = 2;
+  double eps_h       = 3;   // false-positive budget
+  string profile     = 4;   // deployment profile
+  bytes  payload     = 5;   // opaque JSON policy blob
+  VectorClock vclock = 6;
+  double ts          = 7;
+}
+
+// ---- telemetry sharing ----
+message TelemetrySnapshot {
+  string node_id      = 1;
+  double pps          = 2;
+  double active_flows = 3;
+  double dropped      = 4;
+  double quarantined  = 5;
+  double cpu          = 6;
+  double mem          = 7;
+  double latency_ms   = 8;
+  double fpr          = 9;
+  double ts           = 10;
+  string region       = 11;
+  string address      = 12;
+}
+
+// ---- federated model synchronisation ----
+message ModelDelta {
+  string node_id            = 1;
+  repeated double fusion_weights = 2;  // Hedge fusion weights
+  double threshold          = 3;       // representative enforce threshold
+  double eps_h              = 4;
+  uint64 samples            = 5;       // observations behind this delta (avg weight)
+  uint64 round              = 6;
+  double ts                 = 7;
+}
+
+// ---- heartbeat (SWIM ping + piggybacked digest) ----
+message Ping { NodeInfo from = 1; repeated NodeInfo digest = 2; double ts = 3; }
+message Pong { NodeInfo from = 1; repeated NodeInfo digest = 2; double ts = 3; bool ack = 4; }
+
+// ---- anti-entropy gossip (members + intel) ----
+message GossipDigest {
+  string from_node          = 1;
+  repeated NodeInfo members = 2;
+  repeated ThreatEvent intel = 3;
+}
+
+message Ack { bool ok = 1; string node_id = 2; uint64 lamport = 3; }
+
+service SauronMesh {
+  rpc ShareThreatIntel (ThreatBatch)      returns (Ack);
+  rpc SyncPolicy       (PolicyUpdate)     returns (Ack);
+  rpc ShareTelemetry   (TelemetrySnapshot) returns (Ack);
+  rpc SyncModel        (ModelDelta)       returns (Ack);
+  rpc Heartbeat        (Ping)             returns (Pong);
+  rpc Gossip           (GossipDigest)     returns (GossipDigest);
+  rpc StreamIntel      (stream ThreatEvent) returns (stream ThreatEvent);
+}
